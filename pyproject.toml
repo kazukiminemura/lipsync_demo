@@ -1,0 +1,13 @@
+[project]
+name = "musetalk-demo"
+version = "0.1.0"
+description = "Gradio app for generating MuseTalk lip-sync videos from an uploaded image and audio file."
+readme = "Readme.md"
+requires-python = ">=3.10"
+dependencies = [
+    "gradio>=4.44,<6",
+    "numpy>=1.26",
+]
+
+[tool.uv]
+package = false
