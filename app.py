@@ -1,456 +1,513 @@
 from __future__ import annotations
 
-import os
-import queue
+import argparse
 import shutil
 import subprocess
 import sys
-import threading
 import time
+import warnings
 import wave
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
 
-import gradio as gr
+import cv2
 import numpy as np
-from PIL import Image
+import openvino as ov
+import requests
+import torch
+import torch.nn.functional as F
+from huggingface_hub import hf_hub_download
+from tqdm import tqdm
 
+
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API.*", category=UserWarning)
+warnings.filterwarnings("ignore", message="Pass sr=16000, n_fft=800 as keyword args.*", category=FutureWarning)
 
 APP_ROOT = Path(__file__).resolve().parent
+VENDOR_DIR = APP_ROOT / "vendor"
+WAV2LIP_DIR = VENDOR_DIR / "Wav2Lip"
+CHECKPOINT_DIR = APP_ROOT / "checkpoints"
+MODEL_DIR = APP_ROOT / "models" / "wav2lip"
 RUNS_DIR = APP_ROOT / "runs"
-DEFAULT_MUSETALK_DIR = Path(os.environ.get("MUSETALK_DIR", APP_ROOT / "MuseTalk"))
-DEFAULT_OPENVINO_UNET = DEFAULT_MUSETALK_DIR / "models" / "openvino" / "musetalkV15_unet.xml"
-DEFAULT_TORCH_DEVICE = "xpu" if (APP_ROOT / ".xpu-probe" / "Scripts" / "python.exe").exists() else "auto"
-APP_CSS = """
-#main-layout {
-    align-items: flex-start;
-}
 
-#side-panel {
-    max-width: 320px;
-}
-
-#face-image {
-    max-width: 300px;
-}
-
-#face-image .image-container,
-#face-image [data-testid="image"] {
-    min-height: 150px !important;
-    max-height: 190px !important;
-}
-
-#preview-output .image-container,
-#preview-output [data-testid="image"],
-#preview-output video,
-#preview-output .video-container {
-    min-height: 62vh !important;
-    max-height: 70vh !important;
-    object-fit: contain !important;
-}
-
-#preview-status textarea {
-    min-height: 46px !important;
-}
-"""
+FACE_DETECTION_MODEL = MODEL_DIR / "face_detection.xml"
+WAV2LIP_MODEL = MODEL_DIR / "wav2lip.xml"
+IMG_SIZE = 96
+MEL_STEP_SIZE = 16
 
 
-def _default_musetalk_python() -> str:
-    configured = os.environ.get("MUSETALK_PYTHON")
-    if configured:
-        return configured
-
-    xpu_python = APP_ROOT / ".xpu-probe" / "Scripts" / "python.exe"
-    if xpu_python.exists():
-        return str(xpu_python)
-
-    venv_python = DEFAULT_MUSETALK_DIR / ".venv" / "Scripts" / "python.exe"
-    if venv_python.exists():
-        return str(venv_python)
-
-    return sys.executable
+def run_command(command: list[str], cwd: Path | None = None) -> None:
+    process = subprocess.run(command, cwd=cwd, text=True)
+    if process.returncode != 0:
+        raise RuntimeError(f"Command failed ({process.returncode}): {' '.join(command)}")
 
 
-def _quote_yaml(value: str | Path) -> str:
-    text = Path(value).resolve().as_posix()
-    return '"' + text.replace("\\", "/").replace('"', '\\"') + '"'
+def ensure_wav2lip_repo() -> None:
+    VENDOR_DIR.mkdir(parents=True, exist_ok=True)
+    if (WAV2LIP_DIR / "models" / "wav2lip.py").exists():
+        return
+    if WAV2LIP_DIR.exists():
+        shutil.rmtree(WAV2LIP_DIR)
+    print("Cloning Wav2Lip...")
+    run_command(["git", "clone", "--depth", "1", "https://github.com/Rudrabha/Wav2Lip.git", str(WAV2LIP_DIR)])
 
 
-def _copy_upload(source: str | None, target_dir: Path, fallback_name: str) -> Path:
-    if not source:
-        raise gr.Error(f"{fallback_name} をアップロードしてください。")
-
-    source_path = Path(source)
-    suffix = source_path.suffix or Path(fallback_name).suffix
-    target = target_dir / f"{Path(fallback_name).stem}{suffix}"
-    shutil.copy2(source_path, target)
-    return target
+def add_wav2lip_to_path() -> None:
+    ensure_wav2lip_repo()
+    for path in (VENDOR_DIR, WAV2LIP_DIR):
+        path_text = str(path)
+        if path_text not in sys.path:
+            sys.path.insert(0, path_text)
 
 
-def _save_audio_array(audio: tuple[int, np.ndarray], target: Path) -> Path:
-    sample_rate, data = audio
-    samples = np.asarray(data)
-    if samples.size == 0:
-        raise gr.Error("音声が空です。別の音声ファイルを選び直してください。")
-
-    if samples.ndim == 1:
-        samples = samples[:, None]
-
-    if np.issubdtype(samples.dtype, np.floating):
-        samples = np.clip(samples, -1.0, 1.0)
-        samples = (samples * 32767).astype(np.int16)
-    elif samples.dtype != np.int16:
-        max_value = np.iinfo(samples.dtype).max if np.issubdtype(samples.dtype, np.integer) else 32767
-        samples = (samples.astype(np.float32) / max_value * 32767).astype(np.int16)
-
-    with wave.open(str(target), "wb") as wav:
-        wav.setnchannels(samples.shape[1])
-        wav.setsampwidth(2)
-        wav.setframerate(int(sample_rate))
-        wav.writeframes(samples.tobytes())
-
-    return target
-
-
-def _materialize_audio(source: Any, target_dir: Path, fallback_name: str) -> Path:
-    if source is None:
-        raise gr.Error("音声を入力してください。")
-
-    target = target_dir / fallback_name
-    if isinstance(source, (str, Path)):
-        source_path = Path(source)
-        suffix = source_path.suffix or Path(fallback_name).suffix
-        target = target_dir / f"{Path(fallback_name).stem}{suffix}"
-        shutil.copy2(source_path, target)
+def download_file(url: str, target: Path) -> Path:
+    if target.exists():
         return target
-
-    if isinstance(source, tuple) and len(source) == 2:
-        return _save_audio_array(source, target)
-
-    raise gr.Error(f"未対応の音声形式です: {type(source).__name__}")
-
-
-def _musetalk_paths(musetalk_dir: Path) -> dict[str, Path | str]:
-    return {
-        "version": "v15",
-        "openvino_unet_path": musetalk_dir / "models" / "openvino" / "musetalkV15_unet.xml",
-    }
+    target.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading {target.name}...")
+    with requests.get(url, stream=True, timeout=60) as response:
+        response.raise_for_status()
+        with target.open("wb") as file:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    file.write(chunk)
+    return target
 
 
-def _validate_musetalk(musetalk_dir: Path, paths: dict[str, Path | str]) -> None:
-    missing: list[str] = []
-    realtime_module = musetalk_dir / "scripts" / "realtime_inference.py"
-    whisper_dir = musetalk_dir / "models" / "whisper"
+def load_wav2lip_checkpoint(checkpoint_path: Path):
+    add_wav2lip_to_path()
+    from Wav2Lip.models import Wav2Lip
 
-    for path in [realtime_module, whisper_dir, paths["openvino_unet_path"]]:
-        if isinstance(path, Path) and not path.exists():
-            missing.append(str(path))
-
-    if missing:
-        message = "\n".join(missing)
-        raise gr.Error(
-            "MuseTalk 本体またはモデルが見つかりません。\n"
-            "先に `scripts\\setup_musetalk.ps1` を実行するか、MUSETALK_DIR を設定してください。\n\n"
-            f"不足:\n{message}"
-        )
+    model = Wav2Lip()
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state = {key.replace("module.", ""): value for key, value in checkpoint["state_dict"].items()}
+    model.load_state_dict(state)
+    return model.eval()
 
 
-def _latest_image(result_dir: Path, newer_than: float) -> Path | None:
-    candidates = [
-        path
-        for path in result_dir.rglob("*.png")
-        if path.is_file() and path.stat().st_mtime >= newer_than
-    ]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda path: path.stat().st_mtime)
+def ensure_openvino_models() -> None:
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    add_wav2lip_to_path()
 
-
-def _run_command_with_live_frames(
-    command: list[str],
-    cwd: Path,
-    frame_dir: Path,
-    stable_frame: Path,
-    final_video: Path,
-    started_at: float,
-    logs: list[str],
-) -> Iterable[tuple[str | None, str | None, str]]:
-    process = subprocess.Popen(
-        command,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-    )
-
-    output_queue: queue.Queue[str] = queue.Queue()
-
-    def read_output() -> None:
-        assert process.stdout is not None
-        for line in process.stdout:
-            output_queue.put(line.rstrip())
-
-    reader = threading.Thread(target=read_output, daemon=True)
-    reader.start()
-
-    last_frame: Path | None = None
-    while process.poll() is None:
-        while True:
-            try:
-                logs.append(output_queue.get_nowait())
-            except queue.Empty:
-                break
-
-        frame = _latest_image(frame_dir, started_at)
-        if frame is not None:
-            try:
-                shutil.copy2(frame, stable_frame)
-                last_frame = stable_frame
-            except OSError:
-                last_frame = frame
-        video = final_video if final_video.exists() else None
-        yield (
-            str(last_frame) if last_frame else None,
-            str(video) if video else None,
-            "\n".join(logs[-180:]),
-        )
-        time.sleep(0.4)
-
-    reader.join(timeout=1)
-    while True:
-        try:
-            logs.append(output_queue.get_nowait())
-        except queue.Empty:
-            break
-
-    return_code = process.wait()
-    frame = _latest_image(frame_dir, started_at)
-    if frame is not None:
-        try:
-            shutil.copy2(frame, stable_frame)
-            last_frame = stable_frame
-        except OSError:
-            last_frame = frame
-    video = final_video if final_video.exists() else None
-    yield (
-        str(last_frame) if last_frame else None,
-        str(video) if video else None,
-        "\n".join(logs[-180:]),
-    )
-
-    if return_code != 0:
-        raise gr.Error(f"MuseTalk が終了コード {return_code} で停止しました。ログを確認してください。")
-
-
-def generate_realtime_lipsync(
-    image_path: str | None,
-    audio_path: Any,
-    musetalk_dir_text: str,
-    python_executable: str,
-    runtime_device: str,
-    openvino_unet_path: str,
-    openvino_device: str,
-    fps: int,
-    bbox_shift: int,
-    keep_coord: bool,
-    ffmpeg_path: str,
-) -> Iterable[tuple[None | str, None | str, str]]:
-    started_at = time.time()
-    run_id = time.strftime("%Y%m%d-%H%M%S")
-    avatar_id = f"app_{run_id}"
-    run_dir = RUNS_DIR / run_id
-    input_dir = run_dir / "inputs"
-    frame_source_dir = input_dir / "avatar_frames"
-    result_dir = run_dir / "realtime_results"
-    frame_source_dir.mkdir(parents=True, exist_ok=True)
-    result_dir.mkdir(parents=True, exist_ok=True)
-
-    if not image_path:
-        yield None, None, "顔画像をアップロードしてください。"
+    if FACE_DETECTION_MODEL.exists() and WAV2LIP_MODEL.exists():
+        print("OpenVINO models are ready.")
         return
 
-    if audio_path is None:
-        yield image_path, None, "マイク録音を停止すると MuseTalk のライブ生成を開始します。"
-        return
+    from Wav2Lip.face_detection.detection.sfd.net_s3fd import s3fd
 
-    musetalk_dir = Path(musetalk_dir_text or DEFAULT_MUSETALK_DIR).expanduser().resolve()
-    python_bin = python_executable.strip() or sys.executable
-    paths = _musetalk_paths(musetalk_dir)
-    if openvino_unet_path.strip():
-        paths["openvino_unet_path"] = Path(openvino_unet_path.strip()).expanduser().resolve()
-    _validate_musetalk(musetalk_dir, paths)
+    face_checkpoint = CHECKPOINT_DIR / "face_detection.pth"
+    download_file("https://www.adrianbulat.com/downloads/python-fan/s3fd-619a316812.pth", face_checkpoint)
 
-    image = _copy_upload(image_path, input_dir, "avatar.png")
-    Image.open(image).convert("RGB").save(frame_source_dir / "00000000.png")
-    audio = _materialize_audio(audio_path, input_dir, "voice.wav")
+    if not FACE_DETECTION_MODEL.exists():
+        print("Converting face detector to OpenVINO IR...")
+        face_detector = s3fd()
+        face_detector.load_state_dict(torch.load(face_checkpoint, map_location="cpu"))
+        face_detector.eval()
+        dummy_input = torch.FloatTensor(np.random.rand(1, 3, 768, 576))
+        ov_model = ov.convert_model(face_detector, example_input=dummy_input)
+        ov.save_model(ov_model, FACE_DETECTION_MODEL)
+        print(f"Saved {FACE_DETECTION_MODEL}")
 
-    config_path = run_dir / "realtime.yaml"
-    config_path.write_text(
-        "\n".join(
-            [
-                f"{avatar_id}:",
-                "  preparation: True",
-                f"  video_path: {_quote_yaml(frame_source_dir)}",
-                f"  bbox_shift: {bbox_shift}",
-                "  audio_clips:",
-                f"    preview: {_quote_yaml(audio)}",
-                "",
-            ]
+    wav2lip_checkpoint = Path(
+        hf_hub_download(
+            repo_id="numz/wav2lip_studio",
+            filename="Wav2lip/wav2lip.pth",
+            local_dir=str(CHECKPOINT_DIR),
+        )
+    )
+
+    if not WAV2LIP_MODEL.exists():
+        print("Converting Wav2Lip to OpenVINO IR...")
+        wav2lip = load_wav2lip_checkpoint(wav2lip_checkpoint)
+        image_batch = torch.FloatTensor(np.random.rand(16, 6, IMG_SIZE, IMG_SIZE))
+        mel_batch = torch.FloatTensor(np.random.rand(16, 1, 80, MEL_STEP_SIZE))
+        ov_model = ov.convert_model(wav2lip, example_input={"audio_sequences": mel_batch, "face_sequences": image_batch})
+        ov.save_model(ov_model, WAV2LIP_MODEL)
+        print(f"Saved {WAV2LIP_MODEL}")
+
+
+def nms(dets: np.ndarray, threshold: float) -> list[int]:
+    if len(dets) == 0:
+        return []
+
+    x1, y1, x2, y2, scores = dets[:, 0], dets[:, 1], dets[:, 2], dets[:, 3], dets[:, 4]
+    areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+    order = scores.argsort()[::-1]
+    keep: list[int] = []
+
+    while order.size > 0:
+        i = int(order[0])
+        keep.append(i)
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        width = np.maximum(0.0, xx2 - xx1 + 1)
+        height = np.maximum(0.0, yy2 - yy1 + 1)
+        overlap = width * height / (areas[i] + areas[order[1:]] - width * height)
+        order = order[np.where(overlap <= threshold)[0] + 1]
+
+    return keep
+
+
+def decode_boxes(loc: torch.Tensor, priors: torch.Tensor, variances: list[float]) -> torch.Tensor:
+    boxes = torch.cat(
+        (
+            priors[:, :, :2] + loc[:, :, :2] * variances[0] * priors[:, :, 2:],
+            priors[:, :, 2:] * torch.exp(loc[:, :, 2:] * variances[1]),
         ),
-        encoding="utf-8",
+        dim=2,
     )
+    boxes[:, :, :2] -= boxes[:, :, 2:] / 2
+    boxes[:, :, 2:] += boxes[:, :, :2]
+    return boxes
 
-    avatar_root = result_dir / "v15" / "avatars" / avatar_id
-    frame_dir = avatar_root / "tmp"
-    stable_frame = run_dir / "latest_frame.png"
-    final_video = avatar_root / "vid_output" / "preview.mp4"
 
-    command = [
-        python_bin,
-        "-m",
-        "scripts.realtime_inference",
-        "--inference_config",
-        str(config_path),
-        "--result_dir",
-        str(result_dir),
-        "--version",
-        "v15",
-        "--device",
-        runtime_device,
-        "--openvino_unet_path",
-        str(paths["openvino_unet_path"]),
-        "--openvino_device",
-        openvino_device,
-        "--fps",
-        str(fps),
-        "--batch_size",
-        "1",
-    ]
+def batch_detect(face_detector: ov.CompiledModel, images: np.ndarray) -> list[list[np.ndarray]]:
+    input_batch = images - np.array([104, 117, 123])
+    input_batch = input_batch.transpose(0, 3, 1, 2).astype(np.float32)
+    raw_outputs = face_detector({"x": input_batch})
+    outputs = [torch.Tensor(raw_outputs[output]) for output in face_detector.outputs]
 
-    if ffmpeg_path.strip():
-        command.extend(["--ffmpeg_path", ffmpeg_path.strip()])
-    if keep_coord:
-        command.append("--saved_coord")
+    bboxlist = []
+    for i in range(len(outputs) // 2):
+        cls_output = F.softmax(outputs[i * 2], dim=1).data.cpu()
+        reg_output = outputs[i * 2 + 1].data.cpu()
+        batch, _, _, _ = cls_output.size()
+        stride = 2 ** (i + 2)
 
-    logs = [
-        f"Run: {run_id}",
-        f"MuseTalk realtime: {musetalk_dir}",
-        "マイク録音を保存しました。MuseTalk のリアルタイム推論を開始します。",
-        "生成中のフレームをライブ表示します。",
-        "",
-        "Command:",
-        " ".join(command),
-        "",
-    ]
-    yield str(image), None, "\n".join(logs)
+        for _, h_idx, w_idx in zip(*np.where(cls_output[:, 1, :, :] > 0.05)):
+            axc = stride / 2 + w_idx * stride
+            ayc = stride / 2 + h_idx * stride
+            score = cls_output[:, 1, h_idx, w_idx]
+            loc = reg_output[:, :, h_idx, w_idx].contiguous().view(batch, 1, 4)
+            priors = torch.Tensor([[axc, ayc, stride * 4, stride * 4]]).view(1, 1, 4)
+            boxes = decode_boxes(loc, priors, [0.1, 0.2])[:, 0]
+            bboxlist.append(torch.cat([boxes, score.unsqueeze(1)], 1).cpu().numpy())
+
+    bbox_array = np.array(bboxlist) if bboxlist else np.zeros((1, len(images), 5))
+    detections: list[list[np.ndarray]] = []
+    for image_index in range(bbox_array.shape[1]):
+        keep = nms(bbox_array[:, image_index, :], 0.3)
+        detections.append([box for box in bbox_array[keep, image_index, :] if box[-1] > 0.5])
+    return detections
+
+
+def smooth_boxes(boxes: np.ndarray, window: int = 5) -> np.ndarray:
+    smoothed = boxes.copy()
+    for i in range(len(boxes)):
+        smoothed[i] = np.mean(boxes[max(0, i - window + 1) : i + 1], axis=0)
+    return smoothed
+
+
+def face_detect(
+    face_detector: ov.CompiledModel,
+    frames: list[np.ndarray],
+    batch_size: int,
+    pads: tuple[int, int, int, int],
+    smooth: bool,
+) -> list[tuple[np.ndarray, tuple[int, int, int, int]]]:
+    predictions: list[tuple[int, int, int, int] | None] = []
+    for i in tqdm(range(0, len(frames), batch_size), desc="Detecting faces"):
+        detections = batch_detect(face_detector, np.array(frames[i : i + batch_size]))
+        for detection in detections:
+            if not detection:
+                predictions.append(None)
+                continue
+            x1, y1, x2, y2 = map(int, np.clip(detection[0][:-1], 0, None))
+            predictions.append((x1, y1, x2, y2))
+
+    pady1, pady2, padx1, padx2 = pads
+    boxes: list[list[int]] = []
+    for rect, frame in zip(predictions, frames):
+        if rect is None:
+            raise RuntimeError("Face was not detected. Try a clearer frontal face or a smaller crop.")
+        x1, y1, x2, y2 = rect
+        boxes.append(
+            [
+                max(0, y1 - pady1),
+                min(frame.shape[0], y2 + pady2),
+                max(0, x1 - padx1),
+                min(frame.shape[1], x2 + padx2),
+            ]
+        )
+
+    box_array = np.array(boxes)
+    if smooth:
+        box_array = smooth_boxes(box_array)
+
+    results = []
+    for frame, (y1, y2, x1, x2) in zip(frames, box_array):
+        y1, y2, x1, x2 = int(y1), int(y2), int(x1), int(x2)
+        results.append((frame[y1:y2, x1:x2], (y1, y2, x1, x2)))
+    return results
+
+
+def read_face_media(
+    face_video: Path | None,
+    face_image: Path | None,
+    image_fps: float,
+    resize_factor: int,
+    rotate: bool,
+) -> tuple[list[np.ndarray], float, bool]:
+    if face_video:
+        stream = cv2.VideoCapture(str(face_video))
+        fps = stream.get(cv2.CAP_PROP_FPS) or image_fps
+        frames = []
+        while True:
+            ok, frame = stream.read()
+            if not ok:
+                stream.release()
+                break
+            frames.append(frame)
+        static = False
+    elif face_image:
+        frame = cv2.imread(str(face_image))
+        if frame is None:
+            raise RuntimeError(f"Could not read face image: {face_image}")
+        fps = image_fps
+        frames = [frame]
+        static = True
+    else:
+        raise RuntimeError("Specify --face-video or --face-image.")
+
+    processed = []
+    for frame in frames:
+        if resize_factor > 1:
+            frame = cv2.resize(frame, (frame.shape[1] // resize_factor, frame.shape[0] // resize_factor))
+        if rotate:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        processed.append(frame)
+
+    if not processed:
+        raise RuntimeError("No frames were read.")
+    return processed, fps, static
+
+
+def extract_wav(audio_path: Path, run_dir: Path) -> Path:
+    if audio_path.suffix.lower() == ".wav":
+        return audio_path
+    wav_path = run_dir / "audio.wav"
+    run_command(["ffmpeg", "-y", "-i", str(audio_path), "-strict", "-2", str(wav_path)])
+    return wav_path
+
+
+def record_microphone(duration: float, sample_rate: int, device: str | None, output_path: Path) -> Path:
+    if duration <= 0:
+        raise RuntimeError("--mic-duration must be greater than 0.")
 
     try:
-        for frame, video, log in _run_command_with_live_frames(command, musetalk_dir, frame_dir, stable_frame, final_video, started_at, logs):
-            yield frame or str(image), video, log
-    except Exception as exc:
-        logs.append("")
-        logs.append(f"ERROR: {exc}")
-        frame = _latest_image(frame_dir, started_at)
-        yield str(frame) if frame else str(image), str(final_video) if final_video.exists() else None, "\n".join(logs[-180:])
-        return
+        import sounddevice as sd
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("sounddevice is not installed. Run `uv sync` first.") from exc
 
-    if final_video.exists():
-        logs.append("")
-        logs.append(f"完了: {final_video}")
-        yield str(stable_frame if stable_frame.exists() else image), str(final_video), "\n".join(logs[-180:])
-        return
+    input_device: int | str | None = int(device) if device and device.isdigit() else device
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    frames = int(duration * sample_rate)
+    print(f"Recording microphone for {duration:.1f}s at {sample_rate} Hz...")
+    recording = sd.rec(frames, samplerate=sample_rate, channels=1, dtype="float32", device=input_device)
+    sd.wait()
 
-    logs.append("完成動画が見つかりませんでした。MuseTalk のログを確認してください。")
-    yield str(stable_frame if stable_frame.exists() else image), None, "\n".join(logs[-180:])
+    samples = np.clip(recording.reshape(-1), -1.0, 1.0)
+    pcm = (samples * 32767).astype(np.int16)
+    with wave.open(str(output_path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm.tobytes())
+
+    print(f"Recorded audio: {output_path}")
+    return output_path
 
 
-with gr.Blocks(title="MuseTalk 口パク生成", css=APP_CSS) as demo:
-    gr.Markdown("# MuseTalk 口パク生成")
+def build_mel_chunks(audio_path: Path, fps: float, run_dir: Path) -> list[np.ndarray]:
+    add_wav2lip_to_path()
+    from Wav2Lip import audio
 
-    with gr.Row(elem_id="main-layout"):
-        with gr.Column(scale=1, min_width=260, elem_id="side-panel"):
-            image_input = gr.Image(label="顔画像", type="filepath", sources=["upload"], height=170, elem_id="face-image")
+    wav_path = extract_wav(audio_path, run_dir)
+    wav = audio.load_wav(str(wav_path), 16000)
+    mel = audio.melspectrogram(wav)
+    if np.isnan(mel.reshape(-1)).sum() > 0:
+        raise RuntimeError("Mel spectrogram contains NaN values. Try a different audio file.")
 
-            with gr.Accordion("MuseTalk 設定", open=False):
-                musetalk_dir = gr.Textbox(
-                    label="MuseTalk ディレクトリ",
-                    value=str(DEFAULT_MUSETALK_DIR),
-                    placeholder=r"C:\path\to\MuseTalk",
-                )
-                python_executable = gr.Textbox(
-                    label="Python 実行ファイル",
-                    value=_default_musetalk_python(),
-                    placeholder=r"C:\path\to\python.exe",
-                )
-                runtime_device = gr.Radio(["auto", "cpu", "xpu"], value=DEFAULT_TORCH_DEVICE, label="補助デバイス")
-                openvino_unet_path = gr.Textbox(
-                    label="OpenVINO UNet",
-                    value=str(DEFAULT_OPENVINO_UNET),
-                )
-                openvino_device = gr.Radio(["AUTO", "GPU", "CPU"], value="AUTO", label="OpenVINO デバイス")
-                fps = gr.Slider(1, 60, value=25, step=1, label="FPS")
-                bbox_shift = gr.Slider(-20, 20, value=0, step=1, label="BBox shift")
-                keep_coord = gr.Checkbox(value=True, label="座標キャッシュを保存")
-                ffmpeg_path = gr.Textbox(
-                    label="FFmpeg bin パス",
-                    value="",
-                    placeholder=r"C:\path\to\ffmpeg\bin",
-                )
+    chunks = []
+    multiplier = 80.0 / fps
+    i = 0
+    while True:
+        start_idx = int(i * multiplier)
+        if start_idx + MEL_STEP_SIZE > len(mel[0]):
+            chunks.append(mel[:, len(mel[0]) - MEL_STEP_SIZE :])
+            break
+        chunks.append(mel[:, start_idx : start_idx + MEL_STEP_SIZE])
+        i += 1
+    return chunks
 
-        with gr.Column(scale=4, min_width=520):
-            with gr.Tabs():
-                with gr.Tab("OpenVINO リアルタイム推論"):
-                    preview_live_output = gr.Image(label="MuseTalk ライブ表示", type="filepath", height=640, elem_id="preview-output")
-                    with gr.Row():
-                        preview_mic = gr.Audio(
-                            label="マイク",
-                            type="filepath",
-                            sources=["microphone"],
-                            format="wav",
-                            max_length=30,
-                        )
-                        preview_generate_button = gr.Button("録音停止後にライブ生成", variant="primary")
-                    preview_video_output = gr.Video(label="完成動画", autoplay=True)
-                    preview_status = gr.Textbox(label="ログ", lines=12, max_lines=18, elem_id="preview-status")
 
-                    preview_mic.stop_recording(
-                        generate_realtime_lipsync,
-                        inputs=[
-                            image_input,
-                            preview_mic,
-                            musetalk_dir,
-                            python_executable,
-                            runtime_device,
-                            openvino_unet_path,
-                            openvino_device,
-                            fps,
-                            bbox_shift,
-                            keep_coord,
-                            ffmpeg_path,
-                        ],
-                        outputs=[preview_live_output, preview_video_output, preview_status],
-                    )
-                    preview_generate_button.click(
-                        generate_realtime_lipsync,
-                        inputs=[
-                            image_input,
-                            preview_mic,
-                            musetalk_dir,
-                            python_executable,
-                            runtime_device,
-                            openvino_unet_path,
-                            openvino_device,
-                            fps,
-                            bbox_shift,
-                            keep_coord,
-                            ffmpeg_path,
-                        ],
-                        outputs=[preview_live_output, preview_video_output, preview_status],
-                    )
+def prepare_batch(img_batch, mel_batch, frame_batch, coords_batch):
+    images = np.asarray(img_batch)
+    mels = np.asarray(mel_batch)
+    masked = images.copy()
+    masked[:, IMG_SIZE // 2 :] = 0
+    images = np.concatenate((masked, images), axis=3) / 255.0
+    mels = np.reshape(mels, [len(mels), mels.shape[1], mels.shape[2], 1])
+    return images, mels, frame_batch, coords_batch
+
+
+def make_batches(
+    frames: list[np.ndarray],
+    mels: list[np.ndarray],
+    face_results: list[tuple[np.ndarray, tuple[int, int, int, int]]],
+    batch_size: int,
+    static: bool,
+) -> Iterable[tuple[np.ndarray, np.ndarray, list[np.ndarray], list[tuple[int, int, int, int]]]]:
+    img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
+    for i, mel in enumerate(mels):
+        idx = 0 if static else i % len(frames)
+        face, coords = face_results[idx]
+        face = cv2.resize(face, (IMG_SIZE, IMG_SIZE))
+        img_batch.append(face)
+        mel_batch.append(mel)
+        frame_batch.append(frames[idx].copy())
+        coords_batch.append(coords)
+
+        if len(img_batch) >= batch_size:
+            yield prepare_batch(img_batch, mel_batch, frame_batch, coords_batch)
+            img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
+
+    if img_batch:
+        yield prepare_batch(img_batch, mel_batch, frame_batch, coords_batch)
+
+
+def run_wav2lip(
+    face_video: Path | None,
+    face_image: Path | None,
+    audio_path: Path,
+    output_path: Path,
+    device: str,
+    batch_size: int,
+    face_det_batch_size: int,
+    image_fps: float,
+    resize_factor: int,
+    rotate: bool,
+    pads: tuple[int, int, int, int],
+    smooth: bool,
+) -> Path:
+    started_at = time.time()
+    run_dir = RUNS_DIR / time.strftime("%Y%m%d-%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    ensure_openvino_models()
+
+    frames, fps, static = read_face_media(face_video, face_image, image_fps, resize_factor, rotate)
+    print(f"Frames: {len(frames)} at {fps:.2f} FPS")
+
+    mel_chunks = build_mel_chunks(audio_path, fps, run_dir)
+    print(f"Mel chunks: {len(mel_chunks)}")
+
+    if static:
+        frames = frames * len(mel_chunks)
+    else:
+        frames = frames[: len(mel_chunks)]
+
+    core = ov.Core()
+    print(f"Compiling face detector on CPU: {FACE_DETECTION_MODEL}")
+    face_detector = core.compile_model(str(FACE_DETECTION_MODEL), "CPU")
+    face_source = [frames[0]] if static else frames
+    face_results = face_detect(face_detector, face_source, face_det_batch_size, pads, smooth)
+    if static:
+        face_results = face_results * len(mel_chunks)
+
+    print(f"Compiling Wav2Lip on {device}: {WAV2LIP_MODEL}")
+    wav2lip_model = core.compile_model(str(WAV2LIP_MODEL), device)
+
+    frame_h, frame_w = frames[0].shape[:-1]
+    temp_video = run_dir / "result.avi"
+    writer = cv2.VideoWriter(str(temp_video), cv2.VideoWriter_fourcc(*"DIVX"), fps, (frame_w, frame_h))
+
+    batches = make_batches(frames, mel_chunks, face_results, batch_size, static)
+    total_batches = int(np.ceil(float(len(mel_chunks)) / batch_size))
+    for image_batch, mel_batch, frame_batch, coords_batch in tqdm(batches, total=total_batches, desc="Generating"):
+        image_batch = np.transpose(image_batch, (0, 3, 1, 2)).astype(np.float32)
+        mel_batch = np.transpose(mel_batch, (0, 3, 1, 2)).astype(np.float32)
+        predictions = wav2lip_model({"audio_sequences": mel_batch, "face_sequences": image_batch})[wav2lip_model.outputs[0]]
+        predictions = predictions.transpose(0, 2, 3, 1) * 255.0
+
+        for pred, frame, coords in zip(predictions, frame_batch, coords_batch):
+            y1, y2, x1, x2 = coords
+            pred = cv2.resize(pred.astype(np.uint8), (x2 - x1, y2 - y1))
+            frame[y1:y2, x1:x2] = pred
+            writer.write(frame)
+
+    writer.release()
+    wav_path = extract_wav(audio_path, run_dir)
+    run_command(["ffmpeg", "-y", "-i", str(wav_path), "-i", str(temp_video), "-strict", "-2", "-q:v", "1", str(output_path)])
+
+    print(f"Done in {time.time() - started_at:.1f}s")
+    print(f"Output: {output_path}")
+    return output_path
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run OpenVINO Wav2Lip from the command line.")
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument("--face-video", type=Path, help="Input face video.")
+    input_group.add_argument("--face-image", type=Path, help="Input face image. The image is treated as a still video.")
+    audio_group = parser.add_mutually_exclusive_group()
+    audio_group.add_argument("--audio", type=Path, help="Input audio file.")
+    audio_group.add_argument("--mic", action="store_true", help="Record audio directly from the microphone.")
+    parser.add_argument("--output", type=Path, default=APP_ROOT / "runs" / "wav2lip_result.mp4", help="Output mp4 path.")
+    parser.add_argument("--device", default="AUTO", help="OpenVINO device for Wav2Lip: AUTO, CPU, GPU.")
+    parser.add_argument("--batch-size", type=int, default=16, help="Wav2Lip batch size.")
+    parser.add_argument("--face-det-batch-size", type=int, default=4, help="Face detection batch size.")
+    parser.add_argument("--image-fps", type=float, default=25.0, help="FPS used when --face-image is passed.")
+    parser.add_argument("--mic-duration", type=float, default=5.0, help="Microphone recording duration in seconds.")
+    parser.add_argument("--mic-sample-rate", type=int, default=16000, help="Microphone recording sample rate.")
+    parser.add_argument("--mic-device", default=None, help="Optional sounddevice input device name or id.")
+    parser.add_argument("--resize-factor", type=int, default=1, help="Downscale input frames by this factor.")
+    parser.add_argument("--rotate", action="store_true", help="Rotate input frames clockwise.")
+    parser.add_argument("--pad", type=int, nargs=4, default=[0, 10, 0, 0], metavar=("TOP", "BOTTOM", "LEFT", "RIGHT"))
+    parser.add_argument("--no-smooth", action="store_true", help="Disable smoothing for detected face boxes.")
+    parser.add_argument("--setup-only", action="store_true", help="Only download/convert Wav2Lip OpenVINO models.")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.setup_only:
+        ensure_openvino_models()
+        return 0
+
+    audio_path = args.audio
+    if args.mic:
+        audio_path = record_microphone(
+            duration=args.mic_duration,
+            sample_rate=args.mic_sample_rate,
+            device=args.mic_device,
+            output_path=RUNS_DIR / time.strftime("mic-%Y%m%d-%H%M%S.wav"),
+        )
+    if audio_path is None:
+        raise SystemExit("--audio or --mic is required unless --setup-only is used.")
+    if args.face_video is None and args.face_image is None:
+        raise SystemExit("--face-video or --face-image is required unless --setup-only is used.")
+
+    run_wav2lip(
+        face_video=args.face_video,
+        face_image=args.face_image,
+        audio_path=audio_path,
+        output_path=args.output,
+        device=args.device,
+        batch_size=args.batch_size,
+        face_det_batch_size=args.face_det_batch_size,
+        image_fps=args.image_fps,
+        resize_factor=args.resize_factor,
+        rotate=args.rotate,
+        pads=tuple(args.pad),
+        smooth=not args.no_smooth,
+    )
+    return 0
 
 
 if __name__ == "__main__":
-    demo.queue().launch()
+    raise SystemExit(main())

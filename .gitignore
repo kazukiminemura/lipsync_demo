@@ -1,6 +1,8 @@
 __pycache__/
 .venv/
-MuseTalk/
+vendor/
+checkpoints/
+models/wav2lip/
+data/
 runs/
-gradio.*.log
 *.pyc
